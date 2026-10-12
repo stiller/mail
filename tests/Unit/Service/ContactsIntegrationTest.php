@@ -116,6 +116,30 @@ class ContactsIntegrationTest extends TestCase {
 		$this->assertEquals($expected, $actual);
 	}
 
+	public function testGetMatchingRecipientContactWithoutUid(): void {
+		$term = 'jo';
+		$searchResult = [
+			[
+				'FN' => 'John Doe',
+				'EMAIL' => 'john@doe.com',
+			],
+		];
+		$this->common($term, $searchResult, false, false, false);
+		$expected = [
+			[
+				'id' => null,
+				'label' => 'John Doe',
+				'email' => 'john@doe.com',
+				'photo' => null,
+				'source' => 'contacts',
+			],
+		];
+
+		$actual = $this->contactsIntegration->getMatchingRecipient('', $term);
+
+		$this->assertSame($expected, $actual);
+	}
+
 	public function testGetMatchingRecipientRestrictedToGroup() {
 		$term = 'jo'; // searching for: John Doe
 		$searchResult = [
@@ -547,6 +571,44 @@ class ContactsIntegrationTest extends TestCase {
 		$actual = $this->contactsIntegration->getContactsWithName('currentUser', $name);
 
 		$this->assertEquals($expected, $actual);
+	}
+
+	public function testGetContactsWithNameContactWithoutUid(): void {
+		$name = 'John';
+		$this->contactsManager->expects($this->once())
+			->method('isEnabled')
+			->willReturn(true);
+		$this->config->method('getAppValue')
+			->willReturnMap([
+				['core', 'shareapi_allow_share_dialog_user_enumeration', 'yes', 'yes'],
+				['core', 'shareapi_restrict_user_enumeration_to_group', 'no', 'no'],
+				['core', 'shareapi_restrict_user_enumeration_full_match', 'yes', 'no'],
+			]);
+		$this->contactsManager->expects($this->once())
+			->method('search')
+			->with($name, ['FN'], [
+				'enumeration' => true,
+				'fullmatch' => false,
+				'strict_search' => false,
+				'limit' => 20,
+			])
+			->willReturn([
+				[
+					'FN' => 'John Doe',
+					'EMAIL' => 'john@doe.com',
+				],
+			]);
+		$expected = [
+			[
+				'id' => null,
+				'label' => 'John Doe',
+				'email' => 'john@doe.com',
+			],
+		];
+
+		$actual = $this->contactsIntegration->getContactsWithName('currentUser', $name);
+
+		$this->assertSame($expected, $actual);
 	}
 
 	public function testGetPhotoReturnsUri(): void {
