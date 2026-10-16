@@ -551,4 +551,36 @@ class MessageMapperTest extends TestCase {
 		$mails = $this->mapper->findIdsAfter($mailbox, 2, 1234567890 + 200, 5);
 		$this->assertEquals([], $mails);
 	}
+
+	public function testFindByRemoteIdsAcrossChunks(): void {
+		$mailbox = new Mailbox();
+		$mailbox->setId(1);
+		$remoteIds = array_map(static fn (int $i): string => "r$i", range(1, 2500));
+		$qb = $this->db->getQueryBuilder();
+		$insert = $qb->insert($this->mapper->getTableName())
+			->values([
+				'uid' => $qb->createParameter('uid'),
+				'remote_id' => $qb->createParameter('remote_id'),
+				'message_id' => $qb->createParameter('message_id'),
+				'mailbox_id' => $qb->createParameter('mailbox_id'),
+				'subject' => $qb->createNamedParameter('TEST'),
+				'sent_at' => $qb->createNamedParameter($this->timestamp, IQueryBuilder::PARAM_INT),
+				'in_reply_to' => $qb->createNamedParameter('<>'),
+			]);
+		foreach ([...range(1, 2500), 2501] as $i) {
+			$insert->setParameter('uid', $i, IQueryBuilder::PARAM_INT);
+			$insert->setParameter('remote_id', $i === 2501 ? 'r1' : "r$i");
+			$insert->setParameter('message_id', "<r$i@example.com>");
+			$insert->setParameter('mailbox_id', $i === 2501 ? 2 : 1, IQueryBuilder::PARAM_INT);
+			$insert->executeStatement();
+		}
+
+		$messages = $this->mapper->findByRemoteIds($mailbox, [...$remoteIds, 'missing']);
+
+		$found = array_map(static fn ($message) => $message->getRemoteId(), $messages);
+		sort($found);
+		sort($remoteIds);
+		$this->assertSame($remoteIds, $found);
+		$this->assertSame([1], array_values(array_unique(array_map(static fn ($message) => $message->getMailboxId(), $messages))));
+	}
 }

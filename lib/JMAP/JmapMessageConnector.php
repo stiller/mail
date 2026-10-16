@@ -30,6 +30,8 @@ use Psr\Log\LoggerInterface;
  * @psalm-import-type JmapEntityListFilter from JmapOperationsService
  */
 class JmapMessageConnector implements IMessageConnector {
+	private const SYNC_BATCH_SIZE = 1000;
+
 	public function __construct(
 		private readonly JmapOperationsService $jmapOperationsService,
 		private readonly JmapMessageAdapter $jmapMessageAdapter,
@@ -72,9 +74,7 @@ class JmapMessageConnector implements IMessageConnector {
 		}
 
 		$addedUids = [];
-		$addedMessages = [];
 		$modifiedUids = [];
-		$modifiedMessages = [];
 		$deletedUids = [];
 
 		// update local store - deletions
@@ -88,34 +88,35 @@ class JmapMessageConnector implements IMessageConnector {
 		}
 
 		$deltaIds = array_values(array_unique(array_merge($delta['additions'] ?? [], $delta['modifications'] ?? [])));
-		$remoteMessages = $deltaIds === [] ? [] : $this->jmapOperationsService->entityFetchMessage(...$deltaIds);
-		$localMessages = $this->dbMessageMapper->findByRemoteIds($mailbox, $deltaIds);
-		$localMessages = $this->mapMessagesByRemoteId(...$localMessages);
 
 		$nextUid = ($this->dbMessageMapper->findHighestUid($mailbox) ?? 0) + 1;
 
-		foreach (array_keys($remoteMessages) as $remoteId) {
-			$remoteMessage = $remoteMessages[$remoteId];
-			$localMessage = $localMessages[$remoteId] ?? null;
-			$uid = $localMessage?->getUid() ?? $nextUid++;
-			if ($localMessage !== null) {
-				$modifiedUids[] = $uid;
-				$modifiedMessages[] = $this->mergeMessage($localMessage, $remoteMessage);
-			} else {
-				$remoteMessage->setMailboxId($mailbox->getId());
-				$remoteMessage->setUid($uid);
-				$addedUids[] = $uid;
-				$addedMessages[] = $remoteMessage;
-			}
-			unset($remoteMessages[$remoteId]);
-			unset($localMessages[$remoteId]);
-		}
+		foreach (array_chunk($deltaIds, self::SYNC_BATCH_SIZE) as $batch) {
+			$remoteMessages = $this->jmapOperationsService->entityFetchMessage(...$batch);
+			$localMessages = $this->mapMessagesByRemoteId(...$this->dbMessageMapper->findByRemoteIds($mailbox, $batch));
+			$addedMessages = [];
+			$modifiedMessages = [];
 
-		if ($addedMessages !== []) {
-			$this->dbMessageMapper->insertBulk($account, ...$addedMessages);
-		}
-		if ($modifiedMessages !== []) {
-			$this->dbMessageMapper->updateBulk($account, true, ...$modifiedMessages);
+			foreach ($remoteMessages as $remoteId => $remoteMessage) {
+				$localMessage = $localMessages[$remoteId] ?? null;
+				$uid = $localMessage?->getUid() ?? $nextUid++;
+				if ($localMessage !== null) {
+					$modifiedUids[] = $uid;
+					$modifiedMessages[] = $this->mergeMessage($localMessage, $remoteMessage);
+				} else {
+					$remoteMessage->setMailboxId($mailbox->getId());
+					$remoteMessage->setUid($uid);
+					$addedUids[] = $uid;
+					$addedMessages[] = $remoteMessage;
+				}
+			}
+
+			if ($addedMessages !== []) {
+				$this->dbMessageMapper->insertBulk($account, ...$addedMessages);
+			}
+			if ($modifiedMessages !== []) {
+				$this->dbMessageMapper->updateBulk($account, true, ...$modifiedMessages);
+			}
 		}
 
 		$mailbox->setState($delta['state']);

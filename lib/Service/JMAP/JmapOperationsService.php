@@ -64,6 +64,9 @@ use Throwable;
  * }
  */
 class JmapOperationsService {
+	private const FETCH_CHUNK_SIZE = 500;
+	private const QUERY_PAGE_SIZE = 5000;
+
 	protected Client $dataStore;
 	protected ?string $dataAccount = null;
 	private ?int $sessionAccountId = null;
@@ -71,6 +74,13 @@ class JmapOperationsService {
 
 	protected array $entityPropertiesBasic = [
 		'id', 'blobId', 'threadId', 'mailboxIds', 'messageId', 'size',
+	];
+
+	protected array $entityPropertiesEnvelope = [
+		'id', 'blobId', 'threadId', 'mailboxIds', 'messageId', 'size',
+		'receivedAt', 'inReplyTo', 'references', 'sender', 'from', 'keywords',
+		'to', 'cc', 'bcc', 'replyTo', 'subject', 'sentAt', 'hasAttachment',
+		'preview',
 	];
 
 	protected array $entityPropertiesDefault = [
@@ -143,6 +153,23 @@ class JmapOperationsService {
 		} catch (Throwable $e) {
 			throw new ServiceException('JMAP request failed: ' . $e->getMessage(), 0, $e);
 		}
+	}
+
+	/**
+	 * @throws ServiceException
+	 */
+	private function assertResponse(mixed $response): void {
+		if ($response instanceof ResponseException) {
+			throw new ServiceException($response->type() . ': ' . $response->description(), 1);
+		}
+	}
+
+	private function maxObjectsInGet(): int {
+		$limit = $this->dataStore->sessionData()?->capability('urn:ietf:params:jmap:core')?->getProperty('maxObjectsInGet');
+		if (!is_int($limit) || $limit < 1) {
+			return self::FETCH_CHUNK_SIZE;
+		}
+		return min($limit, self::FETCH_CHUNK_SIZE);
 	}
 
 	/**
@@ -505,8 +532,10 @@ class JmapOperationsService {
 		}
 		// transceive
 		$bundle = $this->transceive([$r0, $r1]);
+		$this->assertResponse($bundle->response(0));
 		// extract response
 		$response = $bundle->response(1);
+		$this->assertResponse($response);
 		// convert json objects to message objects
 		$state = $response->state();
 		$list = $response->objects();
@@ -562,21 +591,7 @@ class JmapOperationsService {
 	public function entityDelta(?string $location, string $state): array {
 		// if no state is given, return all entities as additions
 		if (empty($state)) {
-			$results = $this->entityList($location, [], [], null, 'basic');
-			$delta = [
-				'state' => $results['state'],
-				'additions' => [],
-				'modifications' => [],
-				'deletions' => [],
-			];
-			foreach ($results['list'] as $entry) {
-				$remoteId = $entry->getRemoteId();
-				if ($remoteId === null) {
-					continue;
-				}
-				$delta['additions'][] = $remoteId;
-			}
-			return $delta;
+			return $this->entityDeltaInitial($location);
 		}
 		// if location is given, perform delta for specific collection, otherwise perform delta for all collections
 		if (empty($location)) {
@@ -584,6 +599,59 @@ class JmapOperationsService {
 		} else {
 			return $this->entityDeltaSpecific($location, $state);
 		}
+	}
+
+	/**
+	 * Delta of all entities in remote storage, paged to stay within the server's query limit
+	 *
+	 * @param string|null $location optional remote location constraint (e.g. remote collection identifier)
+	 *
+	 * @return array{state:string, additions:array<int, string>, modifications:array<int, string>, deletions:array<int, string>}
+	 * @throws ServiceException
+	 */
+	private function entityDeltaInitial(?string $location): array {
+		$state = null;
+		$additions = [];
+		$position = 0;
+		do {
+			$commands = [];
+			if ($state === null) {
+				$stateRequest = new MailGet($this->account());
+				$stateRequest->target();
+				$stateRequest->property('id');
+				$commands[] = $stateRequest;
+			}
+			$query = new MailQuery($this->account());
+			if (!empty($location)) {
+				$query->filter()->in($location);
+			}
+			$query->sort()->received(false);
+			$query->limitAbsolute($position, self::QUERY_PAGE_SIZE);
+			$commands[] = $query;
+
+			$bundle = $this->transceive($commands);
+			if ($state === null) {
+				$stateResponse = $bundle->first();
+				$this->assertResponse($stateResponse);
+				$state = $stateResponse->state();
+			}
+			$queryResponse = $bundle->last();
+			$this->assertResponse($queryResponse);
+
+			$ids = $queryResponse->list();
+			$tally = count($additions);
+			foreach ($ids as $id) {
+				$additions[$id] = true;
+			}
+			$position += count($ids);
+		} while (count($additions) > $tally);
+
+		return [
+			'state' => $state,
+			'additions' => array_map('strval', array_keys($additions)),
+			'modifications' => [],
+			'deletions' => [],
+		];
 	}
 
 	/**
@@ -716,13 +784,27 @@ class JmapOperationsService {
 	 *
 	 * @param string ...$identifiers remote identifiers
 	 *
-	 * @return Message[]
+	 * @return array<string, Message>
+	 * @throws ServiceException
 	 */
 	public function entityFetchMessage(string ...$identifiers): array {
-		$responses = $this->entityFetchNative(...$identifiers);
 		$list = [];
-		foreach ($responses as $id => $entry) {
-			$list[$id] = $this->jmapMessageAdapter->convertToDatabaseMessage($entry);
+		foreach (array_chunk($identifiers, $this->maxObjectsInGet()) as $chunk) {
+			$request = new MailGet($this->account());
+			$request->target(...$chunk);
+			$request->property(...$this->entityPropertiesEnvelope);
+			$response = $this->transceive([$request])->first();
+			$this->assertResponse($response);
+			foreach ($response->objects() as $so) {
+				if (!$so instanceof MailParametersResponse) {
+					continue;
+				}
+				$id = $so->id();
+				if ($id === null) {
+					continue;
+				}
+				$list[$id] = $this->jmapMessageAdapter->convertToDatabaseMessage($so);
+			}
 		}
 		return $list;
 	}

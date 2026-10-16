@@ -12,8 +12,12 @@ namespace OCA\Mail\Tests\Unit\Service\JMAP;
 use ChristophWurst\Nextcloud\Testing\TestCase;
 use JmapClient\Client;
 use JmapClient\Requests\Mail\MailParameters as MailParametersRequest;
+use JmapClient\Requests\Request;
+use JmapClient\Responses\Mail\MailParameters as MailParametersResponse;
 use JmapClient\Responses\ResponseBundle;
 use JmapClient\Responses\ResponseException;
+use JmapClient\Session\Session;
+use OCA\Mail\Db\Message;
 use OCA\Mail\Exception\ServiceException;
 use OCA\Mail\JMAP\Exception\JmapException;
 use OCA\Mail\JMAP\JmapMailboxAdapter;
@@ -33,6 +37,8 @@ class JmapOperationsServiceTest extends TestCase {
 	private LoggerInterface|MockObject $logger;
 	private Client|MockObject $dataStore;
 	private JmapOperationsService $service;
+	/** @var list<list<array>> */
+	private array $requests = [];
 
 	protected function setUp(): void {
 		parent::setUp();
@@ -349,5 +355,199 @@ class JmapOperationsServiceTest extends TestCase {
 		} catch (JmapException $e) {
 			$this->assertSame(ResponseException::SERVER_UNAVAILABLE, $e->getType());
 		}
+	}
+
+	public function testEntityDeltaWithoutStatePagesThroughTheServerQueryLimit(): void {
+		$ids = $this->remoteIds(12000);
+		$this->serve($ids, 5000, 500);
+
+		$delta = $this->service->entityDelta('inbox', '');
+
+		self::assertSame('state-1', $delta['state']);
+		self::assertSame($ids, $delta['additions']);
+		self::assertSame([], $delta['modifications']);
+		self::assertSame([], $delta['deletions']);
+		$queries = $this->requestsOf('Email/query');
+		self::assertSame([0, 5000, 10000, 12000], array_column($queries, 'position'));
+		self::assertSame(['inMailbox' => 'inbox'], (array)$queries[0]['filter']);
+		self::assertSame([['property' => 'receivedAt', 'isAscending' => false]], array_map(static fn ($sort) => (array)$sort, $queries[0]['sort']));
+		$stateRequests = $this->requestsOf('Email/get');
+		self::assertCount(1, $stateRequests);
+		self::assertSame([], $stateRequests[0]['ids']);
+	}
+
+	public function testEntityDeltaWithoutStateReturnsStateOfEmptyMailbox(): void {
+		$this->serve([], 5000, 500);
+
+		$delta = $this->service->entityDelta('inbox', '');
+
+		self::assertSame('state-1', $delta['state']);
+		self::assertSame([], $delta['additions']);
+		self::assertCount(1, $this->requestsOf('Email/query'));
+	}
+
+	public function testEntityDeltaWithoutStateStopsWhenServerIgnoresPosition(): void {
+		$this->session(500);
+		$this->dataStore->method('perform')->willReturnCallback(function (array $commands): ResponseBundle {
+			$this->record($commands);
+			$responses = [];
+			foreach ($commands as $command) {
+				[$operation, , $identifier] = $command->jsonSerialize();
+				$responses[] = $operation === 'Email/query'
+					? ['Email/query', ['accountId' => 'account1', 'queryState' => 'q', 'ids' => ['a', 'b'], 'position' => 0], $identifier]
+					: ['Email/get', ['accountId' => 'account1', 'state' => 'state-1', 'list' => [], 'notFound' => []], $identifier];
+			}
+			return new ResponseBundle(['methodResponses' => $responses]);
+		});
+
+		$delta = $this->service->entityDelta('inbox', '');
+
+		self::assertSame(['a', 'b'], $delta['additions']);
+		self::assertCount(2, $this->requestsOf('Email/query'));
+	}
+
+	public function testEntityDeltaWithoutStateThrowsOnServerError(): void {
+		$this->session(500);
+		$this->dataStore->method('perform')->willReturnCallback(static function (array $commands): ResponseBundle {
+			$responses = [];
+			foreach ($commands as $command) {
+				[, , $identifier] = $command->jsonSerialize();
+				$responses[] = ['error', ['type' => 'serverFail', 'description' => 'boom'], $identifier];
+			}
+			return new ResponseBundle(['methodResponses' => $responses]);
+		});
+
+		$this->expectException(ServiceException::class);
+		$this->expectExceptionMessage('serverFail: boom');
+
+		$this->service->entityDelta('inbox', '');
+	}
+
+	public function testEntityFetchMessageChunksToTheServerLimitWithoutBodies(): void {
+		$ids = $this->remoteIds(450);
+		$this->serve($ids, 5000, 200);
+
+		$messages = $this->service->entityFetchMessage(...$ids);
+
+		self::assertSame($ids, array_keys($messages));
+		self::assertSame($ids, array_map(static fn (Message $message): ?string => $message->getRemoteId(), array_values($messages)));
+		$gets = $this->requestsOf('Email/get');
+		self::assertSame([200, 200, 50], array_map(static fn (array $get): int => count($get['ids']), $gets));
+		self::assertNotContains('bodyValues', $gets[0]['properties']);
+		self::assertContains('preview', $gets[0]['properties']);
+		self::assertContains('hasAttachment', $gets[0]['properties']);
+		self::assertArrayNotHasKey('fetchAllBodyValues', $gets[0]);
+	}
+
+	public static function chunkSizeProvider(): array {
+		return [
+			'server limit above the cap' => [10000, [500, 500, 1]],
+			'server limit missing' => [null, [500, 500, 1]],
+			'server limit invalid' => [0, [500, 500, 1]],
+		];
+	}
+
+	/**
+	 * @dataProvider chunkSizeProvider
+	 */
+	public function testEntityFetchMessageCapsTheChunkSize(?int $maxObjectsInGet, array $expectedChunks): void {
+		$ids = $this->remoteIds(1001);
+		$this->serve($ids, 5000, $maxObjectsInGet);
+
+		$messages = $this->service->entityFetchMessage(...$ids);
+
+		self::assertCount(1001, $messages);
+		self::assertSame($expectedChunks, array_map(static fn (array $get): int => count($get['ids']), $this->requestsOf('Email/get')));
+	}
+
+	public function testEntityFetchMessageThrowsOnServerError(): void {
+		$this->serve($this->remoteIds(10), 5000, 500, 'requestTooLarge');
+
+		$this->expectException(ServiceException::class);
+		$this->expectExceptionMessage('requestTooLarge');
+
+		$this->service->entityFetchMessage(...$this->remoteIds(10));
+	}
+
+	public function testEntityListThrowsOnServerError(): void {
+		$this->serve($this->remoteIds(600), 5000, 500, 'requestTooLarge');
+
+		$this->expectException(ServiceException::class);
+		$this->expectExceptionMessage('requestTooLarge');
+
+		$this->service->entityList('inbox', [], [], null, 'basic');
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	private function remoteIds(int $count): array {
+		return array_map(static fn (int $i): string => "m$i", range(1, $count));
+	}
+
+	private function session(?int $maxObjectsInGet): void {
+		$core = $maxObjectsInGet === null ? [] : ['maxObjectsInGet' => $maxObjectsInGet];
+		$this->dataStore->method('sessionData')->willReturn(new Session(['capabilities' => ['urn:ietf:params:jmap:core' => $core]]));
+		$this->jmapMessageAdapter->method('convertToDatabaseMessage')
+			->willReturnCallback(static function (MailParametersResponse $source): Message {
+				$message = new Message();
+				$message->setRemoteId($source->id());
+				return $message;
+			});
+	}
+
+	/**
+	 * Fake server: answers Email/query with at most $queryLimit ids per page and
+	 * rejects an Email/get for more than $maxObjectsInGet ids, like Stalwart.
+	 *
+	 * @param list<string> $mailboxIds
+	 */
+	private function serve(array $mailboxIds, int $queryLimit, ?int $maxObjectsInGet, ?string $getError = null): void {
+		$this->session($maxObjectsInGet);
+		$serverLimit = $maxObjectsInGet !== null && $maxObjectsInGet > 0 ? $maxObjectsInGet : 500;
+		$this->dataStore->method('perform')->willReturnCallback(function (array $commands) use ($mailboxIds, $queryLimit, $serverLimit, $getError): ResponseBundle {
+			$this->record($commands);
+			$results = [];
+			$responses = [];
+			foreach ($commands as $command) {
+				[$operation, $arguments, $identifier] = $command->jsonSerialize();
+				if ($operation === 'Email/query') {
+					$position = $arguments['position'] ?? 0;
+					$limit = min($arguments['limit'] ?? PHP_INT_MAX, $queryLimit);
+					$results[$identifier] = array_slice($mailboxIds, $position, $limit);
+					$responses[] = ['Email/query', ['accountId' => 'account1', 'queryState' => 'q', 'ids' => $results[$identifier], 'position' => $position, 'limit' => $queryLimit], $identifier];
+					continue;
+				}
+				$ids = isset($arguments['#ids']) ? $results[$arguments['#ids']->resultOf] : $arguments['ids'];
+				if ($getError !== null || count($ids) > $serverLimit) {
+					$responses[] = ['error', ['type' => $getError ?? 'requestTooLarge', 'description' => 'too many ids'], $identifier];
+					continue;
+				}
+				$responses[] = ['Email/get', ['accountId' => 'account1', 'state' => 'state-1', 'list' => array_map(static fn (string $id): array => ['id' => $id], $ids), 'notFound' => []], $identifier];
+			}
+			return new ResponseBundle(['methodResponses' => $responses]);
+		});
+	}
+
+	/**
+	 * @param Request[] $commands
+	 */
+	private function record(array $commands): void {
+		$this->requests[] = array_map(static fn (Request $command): array => $command->jsonSerialize(), $commands);
+	}
+
+	/**
+	 * @return list<array>
+	 */
+	private function requestsOf(string $operation): array {
+		$arguments = [];
+		foreach ($this->requests as $bundle) {
+			foreach ($bundle as [$name, $command]) {
+				if ($name === $operation) {
+					$arguments[] = $command;
+				}
+			}
+		}
+		return $arguments;
 	}
 }
